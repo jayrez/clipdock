@@ -1,0 +1,28 @@
+services:
+  clipdock:
+    build: .
+    container_name: clipdock
+    ports:
+      - "8080:8080"
+    volumes:
+      - clipdock-data:/data
+    environment:
+      # Shared password required by the UI/API. Strongly recommended if
+      # you're exposing this on a public domain. Leave empty to disable.
+      - APP_PASSWORD=change-me
+      # Auto-delete clips older than N hours (0 = keep forever)
+      - RETENTION_HOURS=72
+      # How many downloads can run at once
+      - MAX_CONCURRENT_JOBS=2
+      # Self-update yt-dlp on container start (recommended)
+      - UPDATE_YTDLP_ON_START=true
+      # Extra yt-dlp flags, e.g. to force a different YouTube client:
+      # - YTDLP_EXTRA_ARGS=--extractor-args youtube:player_client=web_safari
+      # Cookies for age-gated / "confirm you're not a bot" videos.
+      # Mount the file and point at it:
+      # - COOKIES_FILE=/data/cookies.txt
+    restart: unless-stopped
+ 
+volumes:
+  clipdock-data:
+ 
