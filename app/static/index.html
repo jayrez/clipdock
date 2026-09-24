@@ -176,12 +176,26 @@
       </div>
     </div>
     <div>
+      <span class="field-label">Output</span>
+      <div class="seg" id="output" role="group" aria-label="Output">
+        <button data-o="video" aria-pressed="true">Video</button>
+        <button data-o="audio" aria-pressed="false">Audio</button>
+      </div>
+    </div>
+    <div id="qualityBox">
       <span class="field-label">Quality</span>
       <div class="seg" id="quality" role="group" aria-label="Quality">
         <button data-q="best" aria-pressed="true">Best</button>
         <button data-q="1080" aria-pressed="false">1080p</button>
         <button data-q="720" aria-pressed="false">720p</button>
         <button data-q="480" aria-pressed="false">480p</button>
+      </div>
+    </div>
+    <div id="formatBox" hidden>
+      <span class="field-label">Format</span>
+      <div class="seg" id="format" role="group" aria-label="Audio format">
+        <button data-f="m4a" aria-pressed="true">M4A</button>
+        <button data-f="mp3" aria-pressed="false">MP3</button>
       </div>
     </div>
   </div>
@@ -225,8 +239,10 @@
 (() => {
   const $ = id => document.getElementById(id);
   let appKey = "";            // held in memory only
-  let mode = "full";
+  let mode = "full";           // range: full | clip
+  let output = "video";        // video | audio
   let quality = "best";
+  let audioFormat = "m4a";     // m4a | mp3
   let probeTimer = null;
   let pollTimer = null;
   let videoDuration = null;
@@ -296,6 +312,30 @@
       x.setAttribute("aria-pressed", x === b);
   });
 
+  const refreshOutput = () => {
+    const audio = output === "audio";
+    $("qualityBox").hidden = audio;
+    $("formatBox").hidden = !audio;
+    $("modeFull").textContent = audio ? "Full audio" : "Full video";
+    $("go").textContent = "Download " + (audio ? audioFormat.toUpperCase() : "MP4");
+  };
+  $("output").addEventListener("click", e => {
+    const b = e.target.closest("button[data-o]");
+    if (!b) return;
+    output = b.dataset.o;
+    for (const x of $("output").children)
+      x.setAttribute("aria-pressed", x === b);
+    refreshOutput();
+  });
+  $("format").addEventListener("click", e => {
+    const b = e.target.closest("button[data-f]");
+    if (!b) return;
+    audioFormat = b.dataset.f;
+    for (const x of $("format").children)
+      x.setAttribute("aria-pressed", x === b);
+    refreshOutput();
+  });
+
   /* ---------- probe ---------- */
   const probe = async () => {
     const url = $("url").value.trim();
@@ -329,7 +369,7 @@
     const url = $("url").value.trim();
     if (!/^https?:\/\//.test(url)) { $("url").focus(); return; }
 
-    const body = {url, quality};
+    const body = {url, quality, mode: output, audio_format: audioFormat};
     if (mode === "clip") {
       const a = parseTC($("tcIn").value), b = parseTC($("tcOut").value);
       if (a==null || b==null || isNaN(a) || isNaN(b) || b<=a) { refreshDur(); return; }
