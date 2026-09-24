@@ -299,8 +299,10 @@
     const p = d.padStart(d.length > 4 ? 6 : 4, "0");
     return p.match(/../g).join(":");
   };
+  const tcLast = new WeakMap();   // field -> value before the current edit
   const tcSet = (el, value) => {
     el.value = value;
+    tcLast.set(el, value);
     el.setSelectionRange(value.length, value.length);
     refreshDur();
   };
@@ -318,14 +320,23 @@
   const PASS_KEYS = new Set(["Tab","Enter","Escape","ArrowLeft","ArrowRight",
     "ArrowUp","ArrowDown","Home","End"]);
 
+  const tcWhole = el => !!el.value &&
+    el.selectionStart === 0 && el.selectionEnd === el.value.length;
+  // Backspace/Delete drop the rightmost digit; from 00:00 (or with the
+  // whole field selected) they clear it so the placeholder shows again.
+  const tcDelete = (el, value, whole) => {
+    const d = whole ? "" : tcDigits(value);
+    tcSet(el, d ? tcFormat(d.slice(0, -1)) : "");
+  };
+
   for (const el of [$("tcIn"), $("tcOut")]) {
+    el.addEventListener("focus", () => tcLast.set(el, el.value));
     el.addEventListener("keydown", e => {
       if (e.ctrlKey || e.metaKey || e.altKey || PASS_KEYS.has(e.key)) return;
-      const whole = el.value && el.selectionStart === 0 && el.selectionEnd === el.value.length;
+      const whole = tcWhole(el);
       if (e.key === "Backspace" || e.key === "Delete") {
         e.preventDefault();
-        const d = whole ? "" : tcDigits(el.value);
-        tcSet(el, d ? tcFormat(d.slice(0, -1)) : "");
+        tcDelete(el, el.value, whole);
         return;
       }
       if (/^[0-9]$/.test(e.key)) {
@@ -345,9 +356,17 @@
       tcSet(el, d || /\d/.test(text) ? tcFormat(d) : el.value);
     });
     // Autofill, voice input and mobile IMEs bypass keydown: re-apply the mask.
-    el.addEventListener("input", () => {
-      const d = tcDigits(el.value).slice(0, TC_MAX);
-      tcSet(el, d || /\d/.test(el.value) ? tcFormat(d) : "");
+    // Deletions are applied to the pre-edit value so they behave like the
+    // keydown Backspace above; re-masking the post-edit value would turn
+    // "00:0" straight back into "00:00" and the field could never be cleared.
+    el.addEventListener("beforeinput", () => tcLast.set(el, el.value));
+    el.addEventListener("input", e => {
+      if (e.inputType && e.inputType.startsWith("delete"))
+        tcDelete(el, tcLast.get(el) ?? el.value, !/\d/.test(el.value));
+      else {
+        const d = tcDigits(el.value).slice(0, TC_MAX);
+        tcSet(el, d || /\d/.test(el.value) ? tcFormat(d) : "");
+      }
     });
     el.addEventListener("blur", () => tcNormalise(el));
   }
