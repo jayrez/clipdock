@@ -19,7 +19,7 @@ import time
 import uuid
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -113,7 +113,14 @@ class JobRequest(BaseModel):
     url: str
     start: Optional[str] = None   # "MM:SS" / "HH:MM:SS" / seconds
     end: Optional[str] = None
-    quality: str = "best"         # best | 1080 | 720 | 480
+    quality: str = "best"         # best | 1080 | 720 | 480  (video only)
+    mode: Literal["video", "audio"] = "video"
+    audio_format: Literal["m4a", "mp3"] = "m4a"   # audio only
+
+
+def output_ext(req: JobRequest) -> str:
+    """Extension of the file the user asked for."""
+    return req.audio_format if req.mode == "audio" else "mp4"
 
 
 # ---------------------------------------------------------------- jobs
@@ -124,13 +131,15 @@ JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 
 
-def build_cmd(out_tmpl: str, req: JobRequest, section: Optional[str]) -> list[str]:
+def build_cmd(out_tmpl: str, req: JobRequest, section: Optional[str],
+              extract: bool = True) -> list[str]:
+    """extract=False skips audio extraction in audio mode. The trim fallback
+    uses it so the source is encoded once, by ffmpeg_trim, not twice."""
     cmd = [
         YTDLP,
         "--no-playlist",
         "--newline",
         "--no-warnings",
-        "--merge-output-format", "mp4",
         "-o", out_tmpl,
         "--print", "pre_process:%(title)s",
         "--no-simulate",
@@ -138,13 +147,25 @@ def build_cmd(out_tmpl: str, req: JobRequest, section: Optional[str]) -> list[st
     if COOKIES_FILE:
         cmd += ["--cookies", COOKIES_FILE]
 
-    # Prefer mp4/m4a streams so the merged file is a clean .mp4
-    if req.quality in ("1080", "720", "480"):
-        h = req.quality
-        cmd += ["-f", f"bv*[height<={h}]+ba/b[height<={h}]/b",
-                "-S", f"res:{h},ext:mp4:m4a"]
+    if req.mode == "audio":
+        cmd += ["-f", "ba/b"]
+        if req.audio_format == "m4a":
+            # YouTube's m4a stream is already AAC, so preferring it makes
+            # the extraction below a stream copy. Without this the default
+            # sort picks Opus, which would be re-encoded to AAC.
+            cmd += ["-S", "aext:m4a"]
+        if extract:
+            cmd += ["-x", "--audio-format", req.audio_format,
+                    "--audio-quality", "0"]
     else:
-        cmd += ["-f", "bv*+ba/b", "-S", "ext:mp4:m4a"]
+        # Prefer mp4/m4a streams so the merged file is a clean .mp4
+        if req.quality in ("1080", "720", "480"):
+            h = req.quality
+            cmd += ["-f", f"bv*[height<={h}]+ba/b[height<={h}]/b",
+                    "-S", f"res:{h},ext:mp4:m4a"]
+        else:
+            cmd += ["-f", "bv*+ba/b", "-S", "ext:mp4:m4a"]
+        cmd += ["--merge-output-format", "mp4"]
 
     if section:
         # Fast path: ffmpeg fetches only the needed byte ranges. This is
@@ -178,6 +199,9 @@ async def stream_ytdlp(cmd: list[str], job: dict) -> tuple[int, list[str]]:
         if "[Merger]" in line:
             job["status"] = "merging"
             job["progress"] = 100.0
+        if "[ExtractAudio]" in line:
+            job["status"] = "extracting audio"
+            job["progress"] = 100.0
     return await proc.wait(), tail
 
 
@@ -186,14 +210,23 @@ FFMPEG_TIME_RE = re.compile(r"out_time_ms=(\d+)")
 
 async def ffmpeg_trim(src: Path, dest: Path, start: float, end: float,
                       job: dict) -> tuple[int, list[str]]:
-    """Cut [start, end] out of src. Re-encodes for frame-accurate edges."""
+    """Cut [start, end] out of src. Re-encodes for frame-accurate edges.
+
+    The codec flags follow dest's extension: .mp3 and .m4a drop the video
+    stream, anything else is cut as H.264/AAC video."""
     duration = end - start
+    ext = dest.suffix.lower()
+    if ext == ".mp3":
+        codec = ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]
+    elif ext == ".m4a":
+        codec = ["-vn", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+    else:
+        codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
     cmd = [
         FFMPEG, "-hide_banner", "-nostdin", "-y",
         "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
+        *codec,
         "-progress", "pipe:1", "-nostats", "-loglevel", "error",
         str(dest),
     ]
@@ -220,9 +253,18 @@ async def ffmpeg_trim(src: Path, dest: Path, start: float, end: float,
 async def run_job(job_id: str, req: JobRequest, section: Optional[str]):
     job = JOBS[job_id]
     scratch = CLIPS_DIR / f"{job_id}.%(ext)s"
+    want_ext = output_ext(req)
 
     def produced() -> Optional[Path]:
-        found = sorted(CLIPS_DIR.glob(f"{job_id}.*"))
+        # yt-dlp can leave the pre-extraction source (e.g. .webm) next to
+        # the extracted audio, so prefer the extension that was requested
+        # and never pick an in-progress .part / .ytdl file.
+        found = sorted(
+            p for p in CLIPS_DIR.glob(f"{job_id}.*")
+            if p.suffix not in (".part", ".ytdl") and ".part-" not in p.name)
+        for p in found:
+            if p.suffix.lower() == f".{want_ext}":
+                return p
         return found[0] if found else None
 
     async with JOB_SEMAPHORE:
@@ -236,12 +278,16 @@ async def run_job(job_id: str, req: JobRequest, section: Optional[str]):
             # the whole video with the native downloader, then cutting locally.
             if code != 0 and section:
                 job["fallback"] = True
-                job["status"] = "downloading full video"
+                job["status"] = "downloading full audio" if req.mode == "audio" \
+                    else "downloading full video"
                 job["progress"] = 0.0
                 for stale in CLIPS_DIR.glob(f"{job_id}.*"):
                     stale.unlink(missing_ok=True)
+                # No audio extraction here: ffmpeg_trim encodes to the
+                # requested format anyway, so extracting first would
+                # transcode MP3 twice.
                 code, tail = await stream_ytdlp(
-                    build_cmd(str(scratch), req, None), job)
+                    build_cmd(str(scratch), req, None, extract=False), job)
 
             if code != 0:
                 job["status"] = "error"
@@ -258,7 +304,7 @@ async def run_job(job_id: str, req: JobRequest, section: Optional[str]):
             if section and job.get("fallback"):
                 job["status"] = "cutting"
                 job["progress"] = 0.0
-                cut = CLIPS_DIR / f"{job_id}-cut.mp4"
+                cut = CLIPS_DIR / f"{job_id}-cut.{want_ext}"
                 code, tail = await ffmpeg_trim(
                     src, cut, job["start_s"], job["end_s"], job)
                 if code != 0 or not cut.exists():
@@ -376,12 +422,22 @@ async def list_files():
     return {"files": files}
 
 
+MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+}
+
+
 @app.get("/api/files/{filename}")
 async def get_file(filename: str):
     p = safe_clip_path(filename)
     if not p.is_file():
         raise HTTPException(404, "File not found.")
-    return FileResponse(p, filename=p.name, media_type="video/mp4")
+    media_type = MEDIA_TYPES.get(p.suffix.lower(), "application/octet-stream")
+    return FileResponse(p, filename=p.name, media_type=media_type)
 
 
 @app.delete("/api/files/{filename}")

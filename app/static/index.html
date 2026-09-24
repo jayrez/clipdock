@@ -176,6 +176,13 @@
       </div>
     </div>
     <div>
+      <span class="field-label">Output</span>
+      <div class="seg" id="output" role="group" aria-label="Output">
+        <button data-o="video" aria-pressed="true">Video</button>
+        <button data-o="audio" aria-pressed="false">Audio</button>
+      </div>
+    </div>
+    <div id="qualityBox">
       <span class="field-label">Quality</span>
       <div class="seg" id="quality" role="group" aria-label="Quality">
         <button data-q="best" aria-pressed="true">Best</button>
@@ -184,13 +191,20 @@
         <button data-q="480" aria-pressed="false">480p</button>
       </div>
     </div>
+    <div id="formatBox" hidden>
+      <span class="field-label">Format</span>
+      <div class="seg" id="format" role="group" aria-label="Audio format">
+        <button data-f="m4a" aria-pressed="true">M4A</button>
+        <button data-f="mp3" aria-pressed="false">MP3</button>
+      </div>
+    </div>
   </div>
 
   <div id="deck">
     <div class="deck-inner">
       <div class="tc">
         <label for="tcIn">IN</label>
-        <input id="tcIn" placeholder="00:00" spellcheck="false" autocomplete="off">
+        <input id="tcIn" placeholder="00:00" inputmode="numeric" spellcheck="false" autocomplete="off">
       </div>
       <div class="tc-mid">
         <span class="arrow" aria-hidden="true">→</span>
@@ -198,10 +212,10 @@
       </div>
       <div class="tc">
         <label for="tcOut">OUT</label>
-        <input id="tcOut" placeholder="00:10" spellcheck="false" autocomplete="off">
+        <input id="tcOut" placeholder="00:10" inputmode="numeric" spellcheck="false" autocomplete="off">
       </div>
     </div>
-    <p class="deck-hint">MM:SS or HH:MM:SS · cuts are keyframe-accurate</p>
+    <p class="deck-hint">Digits fill from the right: 130 → 01:30, 13000 → 01:30:00 · backspace drops the last digit</p>
   </div>
 
   <button id="go">Download MP4</button>
@@ -225,8 +239,10 @@
 (() => {
   const $ = id => document.getElementById(id);
   let appKey = "";            // held in memory only
-  let mode = "full";
+  let mode = "full";           // range: full | clip
+  let output = "video";        // video | audio
   let quality = "best";
+  let audioFormat = "m4a";     // m4a | mp3
   let probeTimer = null;
   let pollTimer = null;
   let videoDuration = null;
@@ -273,8 +289,87 @@
     $("durChip").textContent =
       (a!=null && b!=null && !isNaN(a) && !isNaN(b) && b>a) ? fmtDur(b-a) : "— s";
   };
-  $("tcIn").addEventListener("input", refreshDur);
-  $("tcOut").addEventListener("input", refreshDur);
+
+  /* ---------- timecode entry mask ----------
+     Broadcast-style: digits enter from the right and push left.
+     1 -> 00:01, 100 -> 01:00, 10000 -> 01:00:00. At most 6 digits. */
+  const TC_MAX = 6;
+  const tcDigits = v => v.replace(/\D/g, "").replace(/^0+/, "");
+  const tcFormat = d => {
+    const p = d.padStart(d.length > 4 ? 6 : 4, "0");
+    return p.match(/../g).join(":");
+  };
+  const tcLast = new WeakMap();   // field -> value before the current edit
+  const tcSet = (el, value) => {
+    el.value = value;
+    tcLast.set(el, value);
+    el.setSelectionRange(value.length, value.length);
+    refreshDur();
+  };
+  // Blur: carry overflow so 00:99 -> 01:39, capped at 99:59:59.
+  const tcNormalise = el => {
+    const d = tcDigits(el.value);
+    if (!d) { if (el.value) tcSet(el, "00:00"); return; }
+    const p = d.padStart(6, "0");
+    let s = Math.min(+p.slice(0,2)*3600 + +p.slice(2,4)*60 + +p.slice(4,6), 99*3600+59*60+59);
+    const h = Math.floor(s/3600), m = Math.floor(s%3600/60); s %= 60;
+    const pad = n => String(n).padStart(2, "0");
+    el.value = (h ? pad(h) + ":" : "") + pad(m) + ":" + pad(s);
+    refreshDur();
+  };
+  const PASS_KEYS = new Set(["Tab","Enter","Escape","ArrowLeft","ArrowRight",
+    "ArrowUp","ArrowDown","Home","End"]);
+
+  const tcWhole = el => !!el.value &&
+    el.selectionStart === 0 && el.selectionEnd === el.value.length;
+  // Backspace/Delete drop the rightmost digit; from 00:00 (or with the
+  // whole field selected) they clear it so the placeholder shows again.
+  const tcDelete = (el, value, whole) => {
+    const d = whole ? "" : tcDigits(value);
+    tcSet(el, d ? tcFormat(d.slice(0, -1)) : "");
+  };
+
+  for (const el of [$("tcIn"), $("tcOut")]) {
+    el.addEventListener("focus", () => tcLast.set(el, el.value));
+    el.addEventListener("keydown", e => {
+      if (e.ctrlKey || e.metaKey || e.altKey || PASS_KEYS.has(e.key)) return;
+      const whole = tcWhole(el);
+      if (e.key === "Backspace" || e.key === "Delete") {
+        e.preventDefault();
+        tcDelete(el, el.value, whole);
+        return;
+      }
+      if (/^[0-9]$/.test(e.key)) {
+        e.preventDefault();
+        const d = tcDigits((whole ? "" : el.value) + e.key);
+        if (d.length <= TC_MAX) tcSet(el, tcFormat(d));
+        return;
+      }
+      // Any other printable character (letters, symbols, space) is dropped.
+      // Named keys (Shift, F5, IME "Process"/"Unidentified") pass through.
+      if (e.key.length === 1) e.preventDefault();
+    });
+    el.addEventListener("paste", e => {
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData("text");
+      const d = tcDigits(text).slice(0, TC_MAX);
+      tcSet(el, d || /\d/.test(text) ? tcFormat(d) : el.value);
+    });
+    // Autofill, voice input and mobile IMEs bypass keydown: re-apply the mask.
+    // Deletions are applied to the pre-edit value so they behave like the
+    // keydown Backspace above; re-masking the post-edit value would turn
+    // "00:0" straight back into "00:00" and the field could never be cleared.
+    el.addEventListener("beforeinput", () => tcLast.set(el, el.value));
+    el.addEventListener("input", e => {
+      if (e.inputType && e.inputType.startsWith("delete"))
+        tcDelete(el, tcLast.get(el) ?? el.value, !/\d/.test(el.value));
+      else {
+        const d = tcDigits(el.value).slice(0, TC_MAX);
+        tcSet(el, d || /\d/.test(el.value) ? tcFormat(d) : "");
+      }
+    });
+    el.addEventListener("blur", () => tcNormalise(el));
+  }
 
   /* ---------- mode + quality ---------- */
   const setMode = m => {
@@ -294,6 +389,30 @@
     quality = b.dataset.q;
     for (const x of $("quality").children)
       x.setAttribute("aria-pressed", x === b);
+  });
+
+  const refreshOutput = () => {
+    const audio = output === "audio";
+    $("qualityBox").hidden = audio;
+    $("formatBox").hidden = !audio;
+    $("modeFull").textContent = audio ? "Full audio" : "Full video";
+    $("go").textContent = "Download " + (audio ? audioFormat.toUpperCase() : "MP4");
+  };
+  $("output").addEventListener("click", e => {
+    const b = e.target.closest("button[data-o]");
+    if (!b) return;
+    output = b.dataset.o;
+    for (const x of $("output").children)
+      x.setAttribute("aria-pressed", x === b);
+    refreshOutput();
+  });
+  $("format").addEventListener("click", e => {
+    const b = e.target.closest("button[data-f]");
+    if (!b) return;
+    audioFormat = b.dataset.f;
+    for (const x of $("format").children)
+      x.setAttribute("aria-pressed", x === b);
+    refreshOutput();
   });
 
   /* ---------- probe ---------- */
@@ -329,8 +448,9 @@
     const url = $("url").value.trim();
     if (!/^https?:\/\//.test(url)) { $("url").focus(); return; }
 
-    const body = {url, quality};
+    const body = {url, quality, mode: output, audio_format: audioFormat};
     if (mode === "clip") {
+      tcNormalise($("tcIn")); tcNormalise($("tcOut"));
       const a = parseTC($("tcIn").value), b = parseTC($("tcOut").value);
       if (a==null || b==null || isNaN(a) || isNaN(b) || b<=a) { refreshDur(); return; }
       if (videoDuration && b > videoDuration + 1) { refreshDur(); }
