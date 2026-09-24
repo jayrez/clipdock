@@ -64,6 +64,25 @@ M4A or MP3, so the audio is only encoded once. It's slower on
 long source videos, but it works when the fast path doesn't — and the finished
 clip is identical.
 
+## Entering timecodes
+
+The IN and OUT fields work like a broadcast timecode entry: type digits only,
+and they fill from the right, pushing earlier digits left.
+
+| Typed | Displayed |
+|---|---|
+| `1` | `00:01` |
+| `10` | `00:10` |
+| `100` | `01:00` |
+| `1000` | `10:00` |
+| `10000` | `01:00:00` |
+
+- Letters and symbols are ignored. Backspace removes the last digit.
+- Entry stops at six digits (`HH:MM:SS`).
+- Pasted text is stripped to its digits, so `1:23:45` pastes as `01:23:45`.
+- Leaving the field normalises overflow, so `00:99` becomes `01:39`.
+- The API itself still accepts `SS`, `MM:SS` or `HH:MM:SS`.
+
 ## Exposing it on your domain
 
 Terminate TLS at your reverse proxy and forward to port 8080. Example
@@ -116,7 +135,6 @@ clipdock/
 
 ## Notes
 
-- Timecodes accept `SS`, `MM:SS`, or `HH:MM:SS`.
 - Section downloads re-encode a few frames around each cut point; everything
   else is stream-copied, so clipping is fast and quality is preserved.
 - Works with any site yt-dlp supports, not just YouTube.
